@@ -4,7 +4,7 @@ import { defineConfig } from "eslint/config";
 import globals from "globals";
 
 export default defineConfig([
-  { ignores: ["**/dist/**"] },
+  { ignores: ["**/dist/**", "antigravity-proxy/**"] },
   {
     files: ["**/*.{js,mjs,cjs,ts,mts,cts}"],
     plugins: { js },
