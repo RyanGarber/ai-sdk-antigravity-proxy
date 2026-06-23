@@ -1,0 +1,6 @@
+packages:
+  - 'antigravity-proxy'
+
+allowBuilds:
+  bun: true
+  esbuild: true

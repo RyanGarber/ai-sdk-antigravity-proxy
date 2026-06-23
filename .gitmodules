@@ -1,0 +1,3 @@
+[submodule "antigravity-proxy"]
+	path = antigravity-proxy
+	url = https://github.com/frieser/antigravity-proxy
