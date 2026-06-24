@@ -271,7 +271,7 @@ function createAISDKStream(
   let activeReasoningId: string | null = null;
   let pendingReasoningSignature: string | undefined;
 
-  const activeToolIds = new Map<string, boolean>();
+  const activeToolIds = new Map<string, Extract<LanguageModelV3StreamPart, { type: 'tool-call' }>>();
 
   return new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
@@ -386,29 +386,40 @@ function createAISDKStream(
             if (delta?.tool_calls) {
               hasPriorToolCalls = true;
               for (const tc of delta.tool_calls) {
+                const { sig: toolSig } = extractSigFromCallId(tc.id);
+                const providerMetadata = toolSig
+                  ? {
+                      providerMetadata: {
+                        [PROVIDER_ID]: { thoughtSignature: toolSig },
+                      },
+                    }
+                  : undefined;
+
                 if (!activeToolIds.has(tc.id)) {
-                  activeToolIds.set(tc.id, true);
-                  const { sig: toolSig } = extractSigFromCallId(tc.id);
                   // The full sig:SIG:id is kept as the id for transparent round-trips;
                   // the signature is also surfaced in providerMetadata.
+                  activeToolIds.set(tc.id, {
+                    type: 'tool-call',
+                    toolCallId: tc.id,
+                    toolName: tc.function.name,
+                    input: '',
+                    ...providerMetadata,
+                  });
                   controller.enqueue({
                     type: "tool-input-start",
                     id: tc.id,
                     toolName: tc.function.name,
-                    ...(toolSig
-                      ? {
-                          providerMetadata: {
-                            [PROVIDER_ID]: { thoughtSignature: toolSig },
-                          },
-                        }
-                      : {}),
+                    ...providerMetadata,
                   });
                 }
+
                 if (tc.function.arguments) {
+                  activeToolIds.get(tc.id)!.input += tc.function.arguments;
                   controller.enqueue({
                     type: "tool-input-delta",
                     id: tc.id,
                     delta: tc.function.arguments,
+                    ...providerMetadata,
                   });
                 }
               }
@@ -439,6 +450,7 @@ function createAISDKStream(
               }
               for (const id of activeToolIds.keys()) {
                 controller.enqueue({ type: "tool-input-end", id });
+                controller.enqueue(activeToolIds.get(id)!);
               }
               activeToolIds.clear();
 
