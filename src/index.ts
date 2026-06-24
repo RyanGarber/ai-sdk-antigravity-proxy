@@ -1,4 +1,6 @@
+export { createAntigravityProxyProvider } from "./provider.js";
 export {
-  createAntigravityProxyProvider,
-  type AntigravityAccount,
-} from "./provider.js";
+  AntigravityProxyProviderOptions,
+  AntigravityProxyModel,
+} from "./types.js";
+export type { AntigravityAccount } from "../antigravity-proxy/src/auth/types.js";

@@ -12,6 +12,7 @@ import {
   getImpersonationHeaders,
   generateFingerprint,
 } from "antigravity-proxy/src/utils/headers.js";
+import { cacheSignature } from "antigravity-proxy/src/utils/cache.js";
 import type {
   LanguageModelV3StreamPart,
   LanguageModelV3CallOptions,
@@ -19,13 +20,19 @@ import type {
   LanguageModelV3FunctionTool,
   ProviderV3,
 } from "@ai-sdk/provider";
-
+import { AntigravityProxyProviderOptions } from "./types.js";
 export type { AntigravityAccount };
 
 // ---------------------------------------------------------------------------
-// In-memory token cache — keyed by refresh token, entirely stateless
-// The cache lives at module scope so it persists across calls within a session
-// while never touching any filesystem or external storage.
+// Provider ID used as the namespace key in providerMetadata / providerOptions
+// ---------------------------------------------------------------------------
+
+const PROVIDER_ID = "antigravity-proxy";
+
+// ---------------------------------------------------------------------------
+// In-memory token cache — keyed by refresh token, entirely stateless.
+// Lives at module scope so it persists across calls within a session while
+// never touching any filesystem or external storage.
 // ---------------------------------------------------------------------------
 
 interface CachedToken {
@@ -51,11 +58,11 @@ async function getValidToken(
   const accessToken = tokenRes.access_token;
   const expiresAt = Date.now() + tokenRes.expires_in * 1_000;
 
-  // Re-use projectId from account if available, otherwise discover it
+  // Re-use projectId from account if available, otherwise discover it once.
   const projectId =
     account.projectId ?? cached?.projectId ?? (await getProjectId(accessToken));
 
-  // Re-use fingerprint from account if available so headers stay stable
+  // Re-use fingerprint from account if available so headers stay stable.
   const fingerprint: DeviceFingerprint =
     account.fingerprint ??
     cached?.fingerprint ??
@@ -67,11 +74,46 @@ async function getValidToken(
 }
 
 // ---------------------------------------------------------------------------
-// Prompt conversion: AI SDK v3 → OpenAI chat messages
+// Session ID: derived per-call from the conversation so that the module-level
+// signature cache in cache.ts is always keyed to the right conversation.
 // ---------------------------------------------------------------------------
+
+function djb2(s: string): number {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+function deriveSessionId(
+  prompt: LanguageModelV3CallOptions["prompt"],
+  refreshToken: string,
+): string {
+  const firstMsg = prompt[0];
+  const seed =
+    refreshToken +
+    (firstMsg
+      ? typeof firstMsg.content === "string"
+        ? firstMsg.content
+        : JSON.stringify(firstMsg.content)
+      : "");
+  return djb2(seed).toString(16);
+}
+
+// ---------------------------------------------------------------------------
+// Prompt conversion: AI SDK v3 → OpenAI chat messages
+// Side-effect: collects (reasoningText, thoughtSignature) pairs from
+// providerOptions on assistant reasoning parts so the caller can pre-populate
+// the signature cache before calling transformToGoogleBody.
+// ---------------------------------------------------------------------------
+
+interface CollectedSignature {
+  text: string;
+  signature: string;
+}
 
 function promptToOpenAIMessages(
   prompt: LanguageModelV3CallOptions["prompt"],
+  signatureCollector: CollectedSignature[],
 ): unknown[] {
   const messages: unknown[] = [];
 
@@ -83,7 +125,6 @@ function promptToOpenAIMessages(
 
     if (msg.role === "user") {
       const parts = msg.content;
-      const textParts = parts.filter((p) => p.type === "text");
       const fileParts = parts.filter((p) => p.type === "file");
 
       if (fileParts.length > 0) {
@@ -101,7 +142,8 @@ function promptToOpenAIMessages(
         }
         messages.push({ role: "user", content: contentArray });
       } else {
-        const text = textParts
+        const text = parts
+          .filter((p) => p.type === "text")
           .map((p) => (p.type === "text" ? p.text : ""))
           .join("");
         messages.push({ role: "user", content: text });
@@ -115,6 +157,25 @@ function promptToOpenAIMessages(
         .map((p) => (p.type === "text" ? p.text : ""))
         .join("");
 
+      // Collect reasoning content and extract any signatures from providerOptions
+      const reasoningParts = msg.content.filter((p) => p.type === "reasoning");
+      const reasoningContent = reasoningParts
+        .map((p) => (p.type === "reasoning" ? p.text : ""))
+        .join("");
+
+      for (const p of reasoningParts) {
+        if (p.type !== "reasoning") continue;
+        const opts = p.providerOptions?.[PROVIDER_ID] as
+          | { thoughtSignature?: string }
+          | undefined;
+        if (opts?.thoughtSignature) {
+          signatureCollector.push({
+            text: p.text,
+            signature: opts.thoughtSignature,
+          });
+        }
+      }
+
       const toolCallParts = msg.content.filter((p) => p.type === "tool-call");
       const toolCalls =
         toolCallParts.length > 0
@@ -122,7 +183,7 @@ function promptToOpenAIMessages(
               .map((p) => {
                 if (p.type !== "tool-call") return undefined;
                 return {
-                  id: p.toolCallId,
+                  id: p.toolCallId, // may contain sig:SIG:id format — keep as-is
                   type: "function",
                   function: {
                     name: p.toolName,
@@ -139,6 +200,7 @@ function promptToOpenAIMessages(
       messages.push({
         role: "assistant",
         content: textContent || null,
+        ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
         ...(toolCalls ? { tool_calls: toolCalls } : {}),
       });
       continue;
@@ -176,7 +238,24 @@ function uint8ToBase64(bytes: Uint8Array): string {
 }
 
 // ---------------------------------------------------------------------------
-// Response stream: Google SSE → AI SDK v3 stream parts
+// Parse the sig: prefix that transformToGoogleBody embeds in tool call IDs.
+// Format: "sig:BASE64_SIGNATURE:original_call_id"
+// ---------------------------------------------------------------------------
+
+function extractSigFromCallId(callId: string): { sig?: string; rawId: string } {
+  if (callId.startsWith("sig:")) {
+    const colon2 = callId.indexOf(":", 4);
+    if (colon2 !== -1) {
+      return { sig: callId.slice(4, colon2), rawId: callId.slice(colon2 + 1) };
+    }
+  }
+  return { rawId: callId };
+}
+
+// ---------------------------------------------------------------------------
+// Response stream: Google SSE → AI SDK v3 stream parts.
+// Thought signatures are propagated via providerMetadata so clients can
+// persist them and feed them back in the next turn via providerOptions.
 // ---------------------------------------------------------------------------
 
 function createAISDKStream(
@@ -188,10 +267,10 @@ function createAISDKStream(
   let buffer = "";
   let hasPriorToolCalls = false;
 
-  // Track open text/reasoning/tool blocks by id so we can open and close them
   let activeTextId: string | null = null;
   let activeReasoningId: string | null = null;
-  // tool call id → whether start was emitted
+  let pendingReasoningSignature: string | undefined;
+
   const activeToolIds = new Map<string, boolean>();
 
   return new ReadableStream<LanguageModelV3StreamPart>({
@@ -226,28 +305,37 @@ function createAISDKStream(
               modelId,
               requestId,
               hasPriorToolCalls,
-            );
+            ) as {
+              choices?: Array<{
+                delta?: {
+                  content?: string;
+                  reasoning_content?: string;
+                  tool_calls?: Array<{
+                    index: number;
+                    id: string;
+                    type: string;
+                    function: { name: string; arguments: string };
+                  }>;
+                };
+                finish_reason?: string | null;
+              }>;
+              usage?: { prompt_tokens?: number; completion_tokens?: number };
+              _signature?: string;
+              _thought?: string;
+            } | null;
+
             if (!chunk) continue;
 
-            const choice = chunk.choices?.[0] as
-              | {
-                  delta?: {
-                    content?: string;
-                    reasoning_content?: string;
-                    tool_calls?: Array<{
-                      index: number;
-                      id: string;
-                      type: string;
-                      function: { name: string; arguments: string };
-                    }>;
-                  };
-                  finish_reason?: string | null;
-                }
-              | undefined;
+            // Accumulate the most recent thought signature; it will be attached
+            // to the reasoning-end or tool-input-start that triggers on finish.
+            if (chunk._signature) {
+              pendingReasoningSignature = chunk._signature;
+            }
 
+            const choice = chunk.choices?.[0];
             const delta = choice?.delta;
 
-            // Reasoning
+            // Reasoning delta
             if (delta?.reasoning_content) {
               if (!activeReasoningId) {
                 activeReasoningId = `reasoning-${requestId}`;
@@ -263,8 +351,26 @@ function createAISDKStream(
               });
             }
 
-            // Text
+            // Text delta
             if (delta?.content) {
+              // If we were in a reasoning block, close it before opening text
+              if (activeReasoningId) {
+                controller.enqueue({
+                  type: "reasoning-end",
+                  id: activeReasoningId,
+                  ...(pendingReasoningSignature
+                    ? {
+                        providerMetadata: {
+                          [PROVIDER_ID]: {
+                            thoughtSignature: pendingReasoningSignature,
+                          },
+                        },
+                      }
+                    : {}),
+                });
+                activeReasoningId = null;
+                pendingReasoningSignature = undefined;
+              }
               if (!activeTextId) {
                 activeTextId = `text-${requestId}`;
                 controller.enqueue({ type: "text-start", id: activeTextId });
@@ -276,16 +382,26 @@ function createAISDKStream(
               });
             }
 
-            // Tool calls
+            // Tool call deltas
             if (delta?.tool_calls) {
               hasPriorToolCalls = true;
               for (const tc of delta.tool_calls) {
                 if (!activeToolIds.has(tc.id)) {
                   activeToolIds.set(tc.id, true);
+                  const { sig: toolSig } = extractSigFromCallId(tc.id);
+                  // The full sig:SIG:id is kept as the id for transparent round-trips;
+                  // the signature is also surfaced in providerMetadata.
                   controller.enqueue({
                     type: "tool-input-start",
                     id: tc.id,
                     toolName: tc.function.name,
+                    ...(toolSig
+                      ? {
+                          providerMetadata: {
+                            [PROVIDER_ID]: { thoughtSignature: toolSig },
+                          },
+                        }
+                      : {}),
                   });
                 }
                 if (tc.function.arguments) {
@@ -298,15 +414,24 @@ function createAISDKStream(
               }
             }
 
-            // Finish
+            // Finish: close all open blocks and emit finish event
             if (choice?.finish_reason) {
-              // Close open blocks
               if (activeReasoningId) {
                 controller.enqueue({
                   type: "reasoning-end",
                   id: activeReasoningId,
+                  ...(pendingReasoningSignature
+                    ? {
+                        providerMetadata: {
+                          [PROVIDER_ID]: {
+                            thoughtSignature: pendingReasoningSignature,
+                          },
+                        },
+                      }
+                    : {}),
                 });
                 activeReasoningId = null;
+                pendingReasoningSignature = undefined;
               }
               if (activeTextId) {
                 controller.enqueue({ type: "text-end", id: activeTextId });
@@ -329,25 +454,18 @@ function createAISDKStream(
                         ? ("tool-calls" as const)
                         : ("other" as const);
 
-              const usage = chunk.usage as
-                | {
-                    prompt_tokens?: number;
-                    completion_tokens?: number;
-                  }
-                | undefined;
-
               controller.enqueue({
                 type: "finish",
                 finishReason: { unified, raw: rawReason ?? undefined },
                 usage: {
                   inputTokens: {
-                    total: usage?.prompt_tokens,
+                    total: chunk.usage?.prompt_tokens,
                     noCache: undefined,
                     cacheRead: undefined,
                     cacheWrite: undefined,
                   },
                   outputTokens: {
-                    total: usage?.completion_tokens,
+                    total: chunk.usage?.completion_tokens,
                     text: undefined,
                     reasoning: undefined,
                   },
@@ -381,7 +499,7 @@ export function createAntigravityProxyProvider({
     languageModel(modelId) {
       return {
         specificationVersion: "v3",
-        provider: "antigravity-proxy",
+        provider: PROVIDER_ID,
         modelId,
         supportedUrls: {},
 
@@ -393,7 +511,24 @@ export function createAntigravityProxyProvider({
           const { accessToken, projectId, fingerprint } =
             await getValidToken(account);
 
-          const messages = promptToOpenAIMessages(options.prompt);
+          // Derive a stable session ID so signatures are keyed to this conversation
+          const sessionId = deriveSessionId(
+            options.prompt,
+            account.refreshToken,
+          );
+
+          // Convert prompt and collect any thought signatures from prior turns
+          const collectedSignatures: CollectedSignature[] = [];
+          const messages = promptToOpenAIMessages(
+            options.prompt,
+            collectedSignatures,
+          );
+
+          // Pre-populate the module-level signature cache so transformToGoogleBody
+          // can attach thoughtSignature fields to assistant messages
+          for (const { text, signature } of collectedSignatures) {
+            cacheSignature(sessionId, text, signature);
+          }
 
           const tools: unknown[] | undefined = options.tools
             ?.filter(
@@ -408,10 +543,14 @@ export function createAntigravityProxyProvider({
               },
             }));
 
+          const providerOptions = AntigravityProxyProviderOptions.parse(
+            options.providerOptions?.[PROVIDER_ID],
+          );
           const openaiBody: Record<string, unknown> = {
             model: modelId,
             messages,
             stream: true,
+            thinking_budget: providerOptions?.thinkingConfig?.thinkingBudget,
             ...(options.maxOutputTokens != null
               ? { max_tokens: options.maxOutputTokens }
               : {}),
@@ -429,8 +568,8 @@ export function createAntigravityProxyProvider({
             openaiBody,
             projectId,
             /* isCli */ false,
-            /* location */ "",
-            /* sessionId */ undefined,
+            /* _location */ "",
+            sessionId,
             /* aggressive */ false,
           );
 
