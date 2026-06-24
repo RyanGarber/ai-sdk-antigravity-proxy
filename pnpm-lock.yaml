@@ -14,9 +14,6 @@ importers:
       '@commander-js/extra-typings':
         specifier: ^15.0.0
         version: 15.0.0(commander@15.0.0)
-      antigravity-proxy:
-        specifier: link:antigravity-proxy
-        version: link:antigravity-proxy
       commander:
         specifier: ^15.0.0
         version: 15.0.0
@@ -33,6 +30,9 @@ importers:
       ai:
         specifier: ^6.0.208
         version: 6.0.208(zod@4.4.3)
+      antigravity-proxy:
+        specifier: link:antigravity-proxy
+        version: link:antigravity-proxy
       eslint:
         specifier: ^10.5.0
         version: 10.5.0
