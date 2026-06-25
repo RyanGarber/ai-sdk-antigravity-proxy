@@ -18,6 +18,8 @@ import type {
   LanguageModelV3CallOptions,
   LanguageModelV3Message,
   LanguageModelV3FunctionTool,
+  LanguageModelV3ToolResultPart,
+  LanguageModelV3ToolResultOutput,
   ProviderV3,
 } from "@ai-sdk/provider";
 import { AntigravityProxyProviderOptions } from "./types.js";
@@ -111,7 +113,7 @@ interface CollectedSignature {
   signature: string;
 }
 
-function promptToOpenAIMessages(
+export function promptToOpenAIMessages(
   prompt: LanguageModelV3CallOptions["prompt"],
   signatureCollector: CollectedSignature[],
 ): unknown[] {
@@ -209,25 +211,47 @@ function promptToOpenAIMessages(
     if (msg.role === "tool") {
       for (const result of msg.content) {
         if (result.type !== "tool-result") continue;
-        const out = result.output;
-        const outputValue =
-          out.type === "text"
-            ? out.value
-            : out.type === "json"
-              ? JSON.stringify(out.value)
-              : "";
-        messages.push({
-          role: "tool",
-          tool_call_id: result.toolCallId,
-          name: result.toolName,
-          content: outputValue,
-        });
+        messages.push(toolResultToOpenAIMessage(result));
       }
       continue;
     }
   }
 
   return messages;
+}
+
+function toolResultToOpenAIMessage(
+  result: LanguageModelV3ToolResultPart,
+): Record<string, unknown> {
+  const base = {
+    role: "tool",
+    tool_call_id: result.toolCallId,
+    name: result.toolName,
+  };
+
+  return {
+    ...base,
+    content: toolResultOutputToContent(result.output),
+  };
+}
+
+function toolResultOutputToContent(
+  output: LanguageModelV3ToolResultOutput,
+): string | Array<{ type: string; [key: string]: unknown }> {
+  switch (output.type) {
+    case "text":
+      return output.value;
+    case "json":
+      return JSON.stringify(output.value);
+    case "execution-denied":
+      return output.reason ?? "Tool execution denied.";
+    case "error-text":
+      return output.value;
+    case "error-json":
+      return JSON.stringify(output.value);
+    case "content":
+      return output.value;
+  }
 }
 
 function uint8ToBase64(bytes: Uint8Array): string {
@@ -503,8 +527,10 @@ const SANDBOX_ENDPOINT =
 
 export function createAntigravityProxyProvider({
   account,
+  test = false,
 }: {
   account: AntigravityAccount;
+  test?: boolean;
 }): ProviderV3 {
   return {
     specificationVersion: "v3",
@@ -521,7 +547,7 @@ export function createAntigravityProxyProvider({
 
         async doStream(options: LanguageModelV3CallOptions) {
           const { accessToken, projectId, fingerprint } =
-            await getValidToken(account);
+            test ? { accessToken: "test", projectId: "test" } : await getValidToken(account);
 
           // Derive a stable session ID so signatures are keyed to this conversation
           const sessionId = deriveSessionId(
@@ -590,6 +616,21 @@ export function createAntigravityProxyProvider({
             fingerprint,
             modelId,
           );
+
+          if (test) {
+            return {
+              stream: new ReadableStream({
+                start(controller) {
+                  controller.enqueue({ type: "stream-start", warnings: [] });
+                  controller.enqueue({ type: "text-start", id: "test" });
+                  controller.enqueue({ type: "text-delta", id: "test", delta: JSON.stringify(googleBody) });
+                  controller.enqueue({ type: "text-end", id: "test" });
+                  controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 0, noCache: undefined, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 0, text: undefined, reasoning: undefined } } });
+                  controller.close();
+                },
+              }),
+            };
+          }
 
           const response = await fetch(SANDBOX_ENDPOINT, {
             method: "POST",
