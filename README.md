@@ -8,7 +8,7 @@ All models support the most important features, such as reasoning, tool calls, m
 | ---------------------------------------------------------------------------------- | ---------- |
 | gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.5-flash-thinking, gemini-2.5-pro | ✅ Yes     |
 | gemini-3-flash, gemini-3-pro, gemini-3-pro-high, gemini-3-pro-low                  | ✅ Yes     |
-| gemini-3.1-pro-high, gemini-3.1-pro-low                                            | ✅ Yes     |
+| gemini-3.1-pro, gemini-3.1-pro-high, gemini-3.1-pro-low                            | ✅ Yes     |
 | gemini-3.5-flash-high, gemini-3.5-flash-medium, gemini-3.5-flash-low               | Unknown    |
 | claude-sonnet-4-5, claude-sonnet-4-5-thinking                                      | ✅ Yes     |
 | claude-sonnet-4-6, claude-sonnet-4-6-thinking, claude-opus-4-6-thinking            | ✅ Yes     |
@@ -59,7 +59,7 @@ for await (const event of stream.fullStream) {
   }
 }
 
-const agy = createAntigravityProxyProvider({
+const provider = createAntigravityProxyProvider({
   account: {
     refreshToken: "your-refresh-token",
     projectId: "your-project-id",
