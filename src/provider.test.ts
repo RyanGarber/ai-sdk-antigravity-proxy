@@ -1,35 +1,57 @@
 import { describe, it, expect } from "vitest";
-import { createAntigravityProxyProvider, promptToOpenAIMessages } from "./provider.js";
+import {
+  createAntigravityProxyProvider,
+  promptToOpenAIMessages,
+  PROVIDER_ID,
+} from "./provider.js";
 import { transformToGoogleBody } from "antigravity-proxy/src/utils/transform.js";
-import { ModelMessage, streamText } from "ai";
+import { generateText, ModelMessage, streamText } from "ai";
+import { AntigravityProxyDeviceFingerprint } from "./types.js";
 
 describe("provider", () => {
-  it("safely creates the provider", async () => {
-    const provider = createAntigravityProxyProvider({
-      account: {
-        email: "",
-        refreshToken: "",
-        lastUsed: 0,
-        healthScore: 0,
-        tokenUsage: 0,
-      },
+  it("calls generateText and gets a fingerprint", async () => {
+    const generate = await generateText({
+      model: createAntigravityProxyProvider({
+        account: { email: "__test__", refreshToken: "__test__" },
+      }).languageModel("gemini-3-flash"),
+      messages: [
+        {
+          role: "user",
+          content: "__test__",
+        },
+      ],
     });
-    expect(provider).toBeDefined();
+    expect.assert(generate.content[0].type === "text");
+    expect(generate.content[0].text).toContain("__test__");
+    expect(
+      (
+        generate.providerMetadata?.[PROVIDER_ID]?.fingerprint as
+          | AntigravityProxyDeviceFingerprint
+          | undefined
+      )?.userAgent,
+    ).toBe("__test__");
   });
 
   it("converts basic text tool result for gemini 3", async () => {
-    const googleBody = transformToGoogleBody({
-      model: "gemini-3-flash",
-      messages: [
-        {
-          role: "tool",
-          tool_call_id: "123",
-          name: "test",
-          content: "test"
-        }
-      ]
-    }, "test", false, "us-central1");
-    expect(googleBody.request.contents[0].parts[0].functionResponse.response.result).toBe("test");
+    const googleBody = transformToGoogleBody(
+      {
+        model: "gemini-3-flash",
+        messages: [
+          {
+            role: "tool",
+            tool_call_id: "123",
+            name: "test",
+            content: "test",
+          },
+        ],
+      },
+      "test",
+      false,
+      "us-central1",
+    );
+    expect(
+      googleBody.request.contents[0].parts[0].functionResponse.response.result,
+    ).toBe("test");
   });
 
   it("passes multimodal content tool results through to openai messages", () => {
@@ -144,7 +166,9 @@ describe("provider", () => {
 
 export async function transform(model: string, messages: ModelMessage[]) {
   const stream = streamText({
-    model: createAntigravityProxyProvider({account: {email: "", refreshToken: "", lastUsed: 0, healthScore: 0, tokenUsage: 0}, test: true}).languageModel(model),
+    model: createAntigravityProxyProvider({
+      account: { email: "__test__", refreshToken: "__test__" },
+    }).languageModel(model),
     messages,
   });
   for await (const chunk of stream.fullStream) {

@@ -1,7 +1,3 @@
-import type {
-  AntigravityAccount,
-  DeviceFingerprint,
-} from "antigravity-proxy/src/auth/types.js";
 import { refreshAccessToken } from "antigravity-proxy/src/auth/oauth.js";
 import { getProjectId } from "antigravity-proxy/src/auth/oauth.js";
 import {
@@ -21,15 +17,23 @@ import type {
   LanguageModelV3ToolResultPart,
   LanguageModelV3ToolResultOutput,
   ProviderV3,
+  LanguageModelV3Content,
+  LanguageModelV3Text,
+  LanguageModelV3Reasoning,
+  LanguageModelV3StreamResult,
+  LanguageModelV3GenerateResult,
 } from "@ai-sdk/provider";
 import { AntigravityProxyProviderOptions } from "./types.js";
-export type { AntigravityAccount };
+import type {
+  AntigravityProxyAccount,
+  AntigravityProxyDeviceFingerprint,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Provider ID used as the namespace key in providerMetadata / providerOptions
 // ---------------------------------------------------------------------------
 
-const PROVIDER_ID = "antigravity-proxy";
+export const PROVIDER_ID = "antigravity-proxy";
 
 // ---------------------------------------------------------------------------
 // In-memory token cache — keyed by refresh token, entirely stateless.
@@ -40,7 +44,7 @@ const PROVIDER_ID = "antigravity-proxy";
 interface CachedToken {
   accessToken: string;
   projectId: string;
-  fingerprint: DeviceFingerprint;
+  fingerprint: AntigravityProxyDeviceFingerprint;
   expiresAt: number;
 }
 
@@ -49,7 +53,7 @@ const tokenCache = new Map<string, CachedToken>();
 const TOKEN_EXPIRY_BUFFER_MS = 60_000;
 
 async function getValidToken(
-  account: AntigravityAccount,
+  account: AntigravityProxyAccount,
 ): Promise<CachedToken> {
   const cached = tokenCache.get(account.refreshToken);
   if (cached && Date.now() < cached.expiresAt - TOKEN_EXPIRY_BUFFER_MS) {
@@ -65,7 +69,7 @@ async function getValidToken(
     account.projectId ?? cached?.projectId ?? (await getProjectId(accessToken));
 
   // Re-use fingerprint from account if available so headers stay stable.
-  const fingerprint: DeviceFingerprint =
+  const fingerprint: AntigravityProxyDeviceFingerprint =
     account.fingerprint ??
     cached?.fingerprint ??
     generateFingerprint(account.email);
@@ -102,10 +106,11 @@ function deriveSessionId(
 }
 
 // ---------------------------------------------------------------------------
-// Prompt conversion: AI SDK v3 → OpenAI chat messages
+// Prompt conversion: AI SDK v6 → OpenAI chat messages
 // Side-effect: collects (reasoningText, thoughtSignature) pairs from
 // providerOptions on assistant reasoning parts so the caller can pre-populate
 // the signature cache before calling transformToGoogleBody.
+// TODO: the signature cache is messy and should be replaced by direct transformation.
 // ---------------------------------------------------------------------------
 
 interface CollectedSignature {
@@ -277,7 +282,7 @@ function extractSigFromCallId(callId: string): { sig?: string; rawId: string } {
 }
 
 // ---------------------------------------------------------------------------
-// Response stream: Google SSE → AI SDK v3 stream parts.
+// Response stream: Google SSE → AI SDK v6 stream parts.
 // Thought signatures are propagated via providerMetadata so clients can
 // persist them and feed them back in the next turn via providerOptions.
 // ---------------------------------------------------------------------------
@@ -286,6 +291,7 @@ function createAISDKStream(
   googleBody: ReadableStream<Uint8Array>,
   modelId: string,
   requestId: string,
+  fingerprint: AntigravityProxyDeviceFingerprint,
 ): ReadableStream<LanguageModelV3StreamPart> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -293,9 +299,12 @@ function createAISDKStream(
 
   let activeTextId: string | null = null;
   let activeReasoningId: string | null = null;
-  let pendingReasoningSignature: string | undefined;
+  let pendingThoughtSignature: string | undefined;
 
-  const activeToolIds = new Map<string, Extract<LanguageModelV3StreamPart, { type: 'tool-call' }>>();
+  const activeToolIds = new Map<
+    string,
+    Extract<LanguageModelV3StreamPart, { type: "tool-call" }>
+  >();
 
   return new ReadableStream<LanguageModelV3StreamPart>({
     async start(controller) {
@@ -353,7 +362,7 @@ function createAISDKStream(
             // Accumulate the most recent thought signature; it will be attached
             // to the reasoning-end or tool-input-start that triggers on finish.
             if (chunk._signature) {
-              pendingReasoningSignature = chunk._signature;
+              pendingThoughtSignature = chunk._signature;
             }
 
             const choice = chunk.choices?.[0];
@@ -382,18 +391,18 @@ function createAISDKStream(
                 controller.enqueue({
                   type: "reasoning-end",
                   id: activeReasoningId,
-                  ...(pendingReasoningSignature
+                  ...(pendingThoughtSignature
                     ? {
                         providerMetadata: {
                           [PROVIDER_ID]: {
-                            thoughtSignature: pendingReasoningSignature,
+                            thoughtSignature: pendingThoughtSignature,
                           },
                         },
                       }
                     : {}),
                 });
                 activeReasoningId = null;
-                pendingReasoningSignature = undefined;
+                pendingThoughtSignature = undefined;
               }
               if (!activeTextId) {
                 activeTextId = `text-${requestId}`;
@@ -423,10 +432,10 @@ function createAISDKStream(
                   // The full sig:SIG:id is kept as the id for transparent round-trips;
                   // the signature is also surfaced in providerMetadata.
                   activeToolIds.set(tc.id, {
-                    type: 'tool-call',
+                    type: "tool-call",
                     toolCallId: tc.id,
                     toolName: tc.function.name,
-                    input: '',
+                    input: "",
                     ...providerMetadata,
                   });
                   controller.enqueue({
@@ -455,18 +464,18 @@ function createAISDKStream(
                 controller.enqueue({
                   type: "reasoning-end",
                   id: activeReasoningId,
-                  ...(pendingReasoningSignature
+                  ...(pendingThoughtSignature
                     ? {
                         providerMetadata: {
                           [PROVIDER_ID]: {
-                            thoughtSignature: pendingReasoningSignature,
+                            thoughtSignature: pendingThoughtSignature,
                           },
                         },
                       }
                     : {}),
                 });
                 activeReasoningId = null;
-                pendingReasoningSignature = undefined;
+                pendingThoughtSignature = undefined;
               }
               if (activeTextId) {
                 controller.enqueue({ type: "text-end", id: activeTextId });
@@ -506,6 +515,11 @@ function createAISDKStream(
                     reasoning: undefined,
                   },
                 },
+                providerMetadata: {
+                  [PROVIDER_ID]: {
+                    fingerprint: { ...fingerprint },
+                  },
+                },
               });
             }
           }
@@ -525,15 +539,228 @@ function createAISDKStream(
 const SANDBOX_ENDPOINT =
   "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 
+async function createAISDKStreamResult(
+  modelId: string,
+  account: AntigravityProxyAccount,
+  options: LanguageModelV3CallOptions,
+): Promise<LanguageModelV3StreamResult> {
+  const { accessToken, projectId, fingerprint } =
+    account.refreshToken === "__test__"
+      ? {
+          accessToken: "__test__",
+          projectId: "__test__",
+          fingerprint: {
+            userAgent: "__test__",
+            quotaUser: "__test__",
+            deviceId: "__test__",
+            platform: "__test__",
+            apiClient: "__test__",
+            ideType: "__test__",
+            platformName: "__test__",
+            sessionToken: "__test__",
+            cliUserAgent: "__test__",
+            cliApiClient: "__test__",
+          } satisfies AntigravityProxyDeviceFingerprint,
+        }
+      : await getValidToken(account);
+
+  // Derive a stable session ID so signatures are keyed to this conversation
+  const sessionId = deriveSessionId(options.prompt, account.refreshToken);
+
+  // Convert prompt and collect any thought signatures from prior turns
+  const collectedSignatures: CollectedSignature[] = [];
+  const messages = promptToOpenAIMessages(options.prompt, collectedSignatures);
+
+  // Pre-populate the module-level signature cache so transformToGoogleBody
+  // can attach thoughtSignature fields to assistant messages
+  for (const { text, signature } of collectedSignatures) {
+    cacheSignature(sessionId, text, signature);
+  }
+
+  const tools: unknown[] | undefined = options.tools
+    ?.filter((t): t is LanguageModelV3FunctionTool => t.type === "function")
+    .map((t) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema,
+      },
+    }));
+
+  const providerOptions = AntigravityProxyProviderOptions.parse(
+    options.providerOptions?.[PROVIDER_ID],
+  );
+  const openaiBody: Record<string, unknown> = {
+    model: modelId,
+    messages,
+    stream: true,
+    thinking_budget: providerOptions?.thinkingConfig?.thinkingBudget,
+    ...(options.maxOutputTokens != null
+      ? { max_tokens: options.maxOutputTokens }
+      : {}),
+    ...(options.temperature != null
+      ? { temperature: options.temperature }
+      : {}),
+    ...(options.topP != null ? { top_p: options.topP } : {}),
+    ...(options.stopSequences?.length ? { stop: options.stopSequences } : {}),
+    ...(tools?.length ? { tools } : {}),
+  };
+
+  const googleBody = transformToGoogleBody(
+    openaiBody,
+    projectId,
+    /* isCli */ false,
+    /* _location */ "",
+    sessionId,
+    /* aggressive */ false,
+  );
+
+  const headers = getImpersonationHeaders(accessToken, fingerprint, modelId);
+
+  if (account.refreshToken === "__test__") {
+    return {
+      stream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings: [] });
+          controller.enqueue({ type: "text-start", id: "1" });
+          controller.enqueue({
+            type: "text-delta",
+            id: "1",
+            delta: JSON.stringify(googleBody),
+          });
+          controller.enqueue({ type: "text-end", id: "1" });
+          controller.enqueue({
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: {
+                total: 0,
+                noCache: undefined,
+                cacheRead: undefined,
+                cacheWrite: undefined,
+              },
+              outputTokens: {
+                total: 0,
+                text: undefined,
+                reasoning: undefined,
+              },
+            },
+            providerMetadata: {
+              [PROVIDER_ID]: {
+                fingerprint: { ...fingerprint },
+              },
+            },
+          });
+          controller.close();
+        },
+      }),
+    };
+  }
+
+  const response = await fetch(SANDBOX_ENDPOINT, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(googleBody),
+    ...(options.abortSignal ? { signal: options.abortSignal } : {}),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Antigravity API error ${response.status}: ${errText}`);
+  }
+
+  if (!response.body) {
+    throw new Error("No response body from Antigravity API.");
+  }
+
+  const requestId = `chatcmpl-${Math.random().toString(36).slice(2)}`;
+  return {
+    stream: createAISDKStream(response.body, modelId, requestId, fingerprint),
+  };
+}
+
+async function consumeAISDKStreamResult(
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+): Promise<LanguageModelV3GenerateResult> {
+  const reader = stream.getReader();
+  const content: LanguageModelV3Content[] = [];
+
+  const texts = new Map<string, LanguageModelV3Text>();
+  const reasonings = new Map<string, LanguageModelV3Reasoning>();
+  let start:
+    | Extract<LanguageModelV3StreamPart, { type: "stream-start" }>
+    | undefined = undefined;
+  let finish:
+    | Extract<LanguageModelV3StreamPart, { type: "finish" }>
+    | undefined = undefined;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    if (value.type === "stream-start") {
+      start = value;
+    } else if (value.type === "finish") {
+      finish = value;
+    } else if (value.type === "text-start") {
+      texts.set(value.id, {
+        type: "text",
+        text: "",
+      });
+    } else if (value.type === "text-delta") {
+      texts.get(value.id)!.text += value.delta;
+    } else if (value.type === "text-end") {
+      content.push({
+        ...texts.get(value.id)!,
+        providerMetadata: value.providerMetadata,
+      });
+      texts.delete(value.id);
+    } else if (value.type === "reasoning-start") {
+      reasonings.set(value.id, { type: "reasoning", text: "" });
+    } else if (value.type === "reasoning-delta") {
+      reasonings.get(value.id)!.text += value.delta;
+    } else if (value.type === "reasoning-end") {
+      content.push({
+        ...reasonings.get(value.id)!,
+        providerMetadata: value.providerMetadata,
+      });
+      reasonings.delete(value.id);
+    } else if (
+      value.type === "tool-call" ||
+      value.type === "tool-approval-request" ||
+      value.type === "tool-result" ||
+      value.type === "source"
+    ) {
+      content.push(value);
+    }
+  }
+
+  return {
+    content,
+    finishReason: finish?.finishReason ?? { unified: "stop", raw: undefined },
+    usage: finish?.usage ?? {
+      inputTokens: {
+        total: 0,
+        noCache: undefined,
+        cacheRead: undefined,
+        cacheWrite: undefined,
+      },
+      outputTokens: { total: 0, text: undefined, reasoning: undefined },
+    },
+    providerMetadata: finish?.providerMetadata,
+    warnings: start?.warnings ?? [],
+  };
+}
+
 export function createAntigravityProxyProvider({
   account,
-  test = false,
 }: {
-  account: AntigravityAccount;
-  test?: boolean;
+  account: AntigravityProxyAccount;
 }): ProviderV3 {
   return {
     specificationVersion: "v3",
+
     languageModel(modelId) {
       return {
         specificationVersion: "v3",
@@ -541,120 +768,14 @@ export function createAntigravityProxyProvider({
         modelId,
         supportedUrls: {},
 
-        async doGenerate() {
-          throw new Error("Only streaming is supported by this provider.");
+        async doGenerate(options: LanguageModelV3CallOptions) {
+          return await consumeAISDKStreamResult(
+            (await createAISDKStreamResult(modelId, account, options)).stream,
+          );
         },
 
         async doStream(options: LanguageModelV3CallOptions) {
-          const { accessToken, projectId, fingerprint } =
-            test ? { accessToken: "test", projectId: "test" } : await getValidToken(account);
-
-          // Derive a stable session ID so signatures are keyed to this conversation
-          const sessionId = deriveSessionId(
-            options.prompt,
-            account.refreshToken,
-          );
-
-          // Convert prompt and collect any thought signatures from prior turns
-          const collectedSignatures: CollectedSignature[] = [];
-          const messages = promptToOpenAIMessages(
-            options.prompt,
-            collectedSignatures,
-          );
-
-          // Pre-populate the module-level signature cache so transformToGoogleBody
-          // can attach thoughtSignature fields to assistant messages
-          for (const { text, signature } of collectedSignatures) {
-            cacheSignature(sessionId, text, signature);
-          }
-
-          const tools: unknown[] | undefined = options.tools
-            ?.filter(
-              (t): t is LanguageModelV3FunctionTool => t.type === "function",
-            )
-            .map((t) => ({
-              type: "function",
-              function: {
-                name: t.name,
-                description: t.description,
-                parameters: t.inputSchema,
-              },
-            }));
-
-          const providerOptions = AntigravityProxyProviderOptions.parse(
-            options.providerOptions?.[PROVIDER_ID],
-          );
-          const openaiBody: Record<string, unknown> = {
-            model: modelId,
-            messages,
-            stream: true,
-            thinking_budget: providerOptions?.thinkingConfig?.thinkingBudget,
-            ...(options.maxOutputTokens != null
-              ? { max_tokens: options.maxOutputTokens }
-              : {}),
-            ...(options.temperature != null
-              ? { temperature: options.temperature }
-              : {}),
-            ...(options.topP != null ? { top_p: options.topP } : {}),
-            ...(options.stopSequences?.length
-              ? { stop: options.stopSequences }
-              : {}),
-            ...(tools?.length ? { tools } : {}),
-          };
-
-          const googleBody = transformToGoogleBody(
-            openaiBody,
-            projectId,
-            /* isCli */ false,
-            /* _location */ "",
-            sessionId,
-            /* aggressive */ false,
-          );
-
-          const headers = getImpersonationHeaders(
-            accessToken,
-            fingerprint,
-            modelId,
-          );
-
-          if (test) {
-            return {
-              stream: new ReadableStream({
-                start(controller) {
-                  controller.enqueue({ type: "stream-start", warnings: [] });
-                  controller.enqueue({ type: "text-start", id: "test" });
-                  controller.enqueue({ type: "text-delta", id: "test", delta: JSON.stringify(googleBody) });
-                  controller.enqueue({ type: "text-end", id: "test" });
-                  controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: { total: 0, noCache: undefined, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 0, text: undefined, reasoning: undefined } } });
-                  controller.close();
-                },
-              }),
-            };
-          }
-
-          const response = await fetch(SANDBOX_ENDPOINT, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(googleBody),
-            ...(options.abortSignal ? { signal: options.abortSignal } : {}),
-          });
-
-          if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(
-              `Antigravity API error ${response.status}: ${errText}`,
-            );
-          }
-
-          if (!response.body) {
-            throw new Error("No response body from Antigravity API.");
-          }
-
-          const requestId = `chatcmpl-${Math.random().toString(36).slice(2)}`;
-
-          return {
-            stream: createAISDKStream(response.body, modelId, requestId),
-          };
+          return await createAISDKStreamResult(modelId, account, options);
         },
       };
     },
@@ -662,9 +783,11 @@ export function createAntigravityProxyProvider({
     embeddingModel() {
       throw new Error("Only language models are supported by this provider.");
     },
+
     imageModel() {
       throw new Error("Only language models are supported by this provider.");
     },
+
     rerankingModel() {
       throw new Error("Only language models are supported by this provider.");
     },

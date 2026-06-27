@@ -1,4 +1,14 @@
+import type { DeviceFingerprint as AntigravityProxyDeviceFingerprint } from "antigravity-proxy/src/auth/types.js";
 import { z } from "zod";
+
+export type { AntigravityProxyDeviceFingerprint };
+
+export interface AntigravityProxyAccount {
+  email: string;
+  refreshToken: string;
+  projectId?: string;
+  fingerprint?: AntigravityProxyDeviceFingerprint;
+}
 
 export const AntigravityProxyModel = z.enum([
   "claude-sonnet-4-6",

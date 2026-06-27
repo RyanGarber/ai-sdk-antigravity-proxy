@@ -6,11 +6,11 @@ import {
 } from "antigravity-proxy/src/auth/oauth.js";
 import { Command } from "@commander-js/extra-typings";
 import { createServer } from "node:http";
-import * as child_process from "node:child_process";
 import packageJson from "../package.json" with { type: "json" };
 import { streamText } from "ai";
 import { createAntigravityProxyProvider } from "./provider.js";
 import { writeFileSync } from "node:fs";
+import open from "open";
 
 if (typeof process !== "undefined") {
   const program = new Command()
@@ -22,12 +22,10 @@ if (typeof process !== "undefined") {
     .description("Get Antigravity credentials")
     .action(async () => {
       const authUrl = generateAuthUrl();
+      await open(authUrl);
 
       console.log(`Your sign in link: ${authUrl}`);
       console.log("Waiting for you to sign in...");
-
-      // open in browser
-      child_process.exec(`open ${authUrl}`);
 
       const server = createServer(async (req, res) => {
         const url = new URL(req.url ?? "", `http://${req.headers.host}`);
@@ -87,6 +85,10 @@ if (typeof process !== "undefined") {
     )
     .option("-e, --email <value>", "Email address to use for authentication")
     .option("-p, --project-id <value>", "Project ID to use for authentication")
+    .option(
+      "-f, --fingerprint <value>",
+      "Fingerprint to reuse from a prior call",
+    )
     .option("-o, --output <file>", "Log raw output to a file")
     .option("-v, --verbose", "Log raw output to the console")
     .description("Call a model")
@@ -94,7 +96,7 @@ if (typeof process !== "undefined") {
       async (
         model,
         prompt,
-        { refreshToken, email, projectId, output, verbose },
+        { refreshToken, email, projectId, fingerprint, output, verbose },
       ) => {
         if (!refreshToken || !email) {
           console.error("Error: a refresh token and an email are required");
@@ -108,9 +110,7 @@ if (typeof process !== "undefined") {
               refreshToken,
               email,
               projectId,
-              healthScore: 100,
-              tokenUsage: 0,
-              lastUsed: 0,
+              fingerprint: fingerprint ? JSON.parse(fingerprint) : undefined,
             },
           }).languageModel(model),
           messages: [{ role: "user", content: prompt.join(" ") }],
@@ -136,7 +136,7 @@ if (typeof process !== "undefined") {
 
           if (chunk.type === "text-start") {
             console.log();
-            console.log("-- Generating... --");
+            console.log("-- Responding... --");
           } else if (chunk.type === "text-delta") {
             console.log(chunk.text);
           } else if (chunk.type === "text-end") {
